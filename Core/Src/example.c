@@ -58,60 +58,6 @@ int MPU6050_BURST_READ_STM32(uint16_t regAddr, uint8_t* data, uint16_t bytes)
     return 0;
 }
 
-void poll_axes_individually(MPU6050_REG_READ_TYPE readReg)
-{
-    char txBuff[100];
-    int numSamples = 6 * 5 * 100; //6 axis * 5 seconds * 100 samples/sec
-    float samples[numSamples];
-    uint8_t buffLen = 0;
-    const float samplingFreq = 100; //100Hz freq
-    const float samplingPeriod = 1.0f / samplingFreq; //0.01s
-    const int samplingPeriodMs = (int)S_TO_MS(samplingPeriod);
-    buffLen = sprintf(txBuff, "\r\naccelX, accelY, accelZ, gyroX, gyroY, gyroZ");
-    HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
-    txBuff[0] = '\0';
-    int i = 0;
-    while (i < numSamples)
-    {
-        /* USER CODE END WHILE */
-        int startRead = HAL_GetTick();
-        float accelX = read_accel_axis(REG_ACCEL_X_MEASURE_1, ACCEL_FS_2_DIV, readReg);
-        samples[i++] = accelX;
-        
-        float accelY = read_accel_axis(REG_ACCEL_Y_MEASURE_1, ACCEL_FS_2_DIV, readReg);
-        samples[i++] = accelY;
-        
-        float accelZ = read_accel_axis(REG_ACCEL_Z_MEASURE_1, ACCEL_FS_2_DIV, readReg);
-        samples[i++] = accelZ;
-
-        float gyroX = read_gyro_axis(REG_GYRO_X_MEASURE_1, GYRO_FS_250_DIV, readReg);
-        samples[i++] = gyroX;
-
-        float gyroY = read_gyro_axis(REG_GYRO_Y_MEASURE_1, GYRO_FS_250_DIV, readReg);
-        samples[i++] = gyroY;
-
-        float gyroZ = read_gyro_axis(REG_GYRO_Z_MEASURE_1, GYRO_FS_250_DIV, readReg);
-        samples[i++] = gyroZ;
-
-
-        int endRead = HAL_GetTick();
-        int totalTime = endRead - startRead; //ms
-        HAL_Delay(samplingPeriodMs - totalTime);
-    }
-    //write data out to uart
-    i = 0;
-    while(i < numSamples)
-    {
-        buffLen = sprintf(txBuff, "\r\n%.2f, %.2f, %.2f, %.2f, %.2f, %.2f", 
-            samples[i], samples[i + 1], samples[i + 2], //accel xyz
-            samples[i + 3], samples[i + 4], samples[i + 5] //gyro xyz
-        );
-        HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
-        txBuff[0] = '\0';
-        i += 6;
-    }
-}
-
 void fifo_count_test(uint16_t readPeriodMs, uint16_t sampleRate, uint8_t numAxes, MPU6050_BURST_READ_TYPE burstRead, MPU6050_REG_READ_TYPE readReg)
 {
     int buffLen = 0; //uart buff len

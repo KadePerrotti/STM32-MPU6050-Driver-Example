@@ -28,13 +28,6 @@ int MPU6050_REG_READ_STM32(uint16_t regAddr, uint8_t* valAddr);
 int MPU6050_BURST_READ_STM32(uint16_t regAddr, uint8_t* data, uint16_t bytes);
 
 /**
- * testing function that reads each gyro and accel axis individually
- * from the individual register, then does
- * a debug print
- */
-void poll_axes_individually(MPU6050_REG_READ_TYPE readReg);
-
-/**
  * Periodically checks the fifo count. Uses readPeriod, sampleRate, and
  * numAxes to determine if the count matches the expected count.
  * @param readPeriodMs: How often to check the fifo count

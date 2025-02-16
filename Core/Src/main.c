@@ -57,6 +57,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void SelfTests_Print(FACTORY_TEST_RESULTS gyroResults, FACTORY_TEST_RESULTS accelResults);
 void ReadSetupRegisters_Print(SETUP_REGISTERS vals);
+void pollAxes_Print(float *data, uint16_t size);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -101,6 +102,7 @@ int main(void)
   MPU6050_BURST_READ_TYPE* burstRead = MPU6050_BURST_READ_STM32;
   MPU6050_REG_WRITE_TYPE* writeReg = MPU6050_REG_WRITE_STM32;
   DELAY_MS_TYPE* delay = HAL_Delay;
+  TIME_MS_TYPE* getTime = HAL_GetTick;
 
 
   uint16_t result = init_mpu6050(writeReg, delay);
@@ -128,7 +130,15 @@ int main(void)
   FACTORY_TEST_RESULTS accelResults = accel_self_test(readReg, writeReg, delay);
   SelfTests_Print(gyroResults, accelResults);
   
-  poll_axes_individually(readReg);
+  uint16_t sampleRate = 100; //Hz
+  uint16_t sampleTime = 250; //ms
+  int numSamples = 6 * MS_TO_S((float)sampleTime) * sampleRate;
+
+  float data[numSamples];
+  poll_axes_individually(sampleRate, sampleTime, ACCEL_FS_2_DIV, GYRO_FS_250_DIV, data, readReg, delay, getTime);
+  pollAxes_Print(data, numSamples);
+
+  //fifo related tests
 
   // //3 gyro axes at 100Hz for 1 sec
   writeReg(REG_FIFO_EN, XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
@@ -335,6 +345,30 @@ void ReadSetupRegisters_Print(SETUP_REGISTERS vals)
     );
     HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, uart_buf_len, 100);
     txBuff[0] = '\0';
+}
+
+void pollAxes_Print(float *data, uint16_t size)
+{
+  //write data out to uart
+  uint16_t i = 0;
+  int buffLen = 0;
+  char txBuff[100];
+
+  //print table header
+  buffLen = sprintf(txBuff, "\r\n\naccelX, accelY, accelZ, gyroX, gyroY, gyroZ");
+  HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
+  txBuff[0] = '\0';
+
+  while(i < size)
+  {
+      buffLen = sprintf(txBuff, "\r\n%.2f, %.2f, %.2f, %.2f, %.2f, %.2f", 
+          data[i], data[i + 1], data[i + 2], //accel xyz
+          data[i + 3], data[i + 4], data[i + 5] //gyro xyz
+      );
+      HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
+      txBuff[0] = '\0';
+      i += 6;
+  }
 }
 
 
