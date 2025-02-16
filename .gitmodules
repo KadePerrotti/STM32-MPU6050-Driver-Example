@@ -1,0 +1,3 @@
+[submodule "Drivers/MPU6050-Driver"]
+	path = Drivers/MPU6050-Driver
+	url = https://github.com/KadePerrotti/MPU6050-Driver.git
