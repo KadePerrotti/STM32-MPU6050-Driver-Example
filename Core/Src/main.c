@@ -25,10 +25,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "../../Drivers/MPU6050-Driver/REG_OPTIONS.h"
-#include "../../Drivers/MPU6050-Driver/MPU6050.h"
-#include "../../Drivers/MPU6050-Driver/TEST_FUNCTIONS.h"
-#include "example.h"
+#include <string.h> //for clearing the string buffer
+
+//don't forget to add the directory the MPU6050 files are in to your include path
+#include "MPU6050.h"
+#include "REG_OPTIONS.h"
+#include "TEST_FUNCTIONS.h"
 
 /* USER CODE END Includes */
 
@@ -39,7 +41,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PRINT_BUFF_SIZE (1024)
+#define HAL_I2C_TIMEOUT (100)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,9 +58,9 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void SelfTests_Print(FACTORY_TEST_RESULTS gyroResults, FACTORY_TEST_RESULTS accelResults);
-void ReadSetupRegisters_Print(SETUP_REGISTERS vals);
-void pollAxes_Print(float *data, uint16_t size);
+int stm32_reg_write_mpu6050(uint16_t regAddr, uint8_t regValue);
+int stm32_reg_read_mpu6050(uint16_t regAddr, uint8_t* valAddr);
+int stm32_burst_read_mpu6050(uint16_t regAddr, uint8_t* data, uint16_t bytes);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -73,7 +76,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  
+  char printBuff[PRINT_BUFF_SIZE]; //used by print helper functions
+  uint16_t stringLen = 0; //length of string in buffer
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -98,14 +102,16 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  MPU6050_REG_READ_TYPE* readReg = MPU6050_REG_READ_STM32;
-  MPU6050_BURST_READ_TYPE* burstRead = MPU6050_BURST_READ_STM32;
-  MPU6050_REG_WRITE_TYPE* writeReg = MPU6050_REG_WRITE_STM32;
+  MPU6050_REG_WRITE_TYPE* writeReg = stm32_reg_write_mpu6050;
+  MPU6050_REG_READ_TYPE* readReg = stm32_reg_read_mpu6050;
+  MPU6050_BURST_READ_TYPE* burstRead = stm32_burst_read_mpu6050;
   DELAY_MS_TYPE* delay = HAL_Delay;
   TIME_MS_TYPE* getTime = HAL_GetTick;
 
+  init_mpu6050(writeReg, delay);
+  
 
-  uint16_t result = init_mpu6050(writeReg, delay);
+  //configure important accelerometer and gyro settings
   
   //setup the low pass filter. 
   writeReg(REG_CONFIG, DLPF_CFG_6 | EXT_SYNC_OFF);
@@ -114,70 +120,252 @@ int main(void)
   writeReg(REG_GYRO_CONFIG, GYRO_FS_SEL_250_DPS);   
   
   //select Accelerometer's full scale range
-  writeReg(REG_ACCEL_CONFIG, ACCEL_FS_2G);
+  writeReg(REG_ACCEL_CONFIG, ACCEL_FS_SEL_2G);
 
   //setup the sample rate divider
   writeReg(REG_SMPRT_DIV, SAMPLE_RATE_100Hz);
 
-  SETUP_REGISTERS vals = read_setup_registers(readReg);
-  ReadSetupRegisters_Print(vals);
+  //read back the setup register values, and compare them to expected
+  SETUP_REGISTERS expected = {
+    .fsync = EXT_SYNC_OFF, 
+    .dlpf = DLPF_CFG_6,
+    .gyro_sel = GYRO_FS_SEL_250_DPS,
+    .accel_sel = ACCEL_FS_SEL_2G,
+    .rate_div = SAMPLE_RATE_100Hz
+  };
+  
+  SETUP_REGISTERS actual = read_setup_registers(readReg);
+  
+  stringLen = build_setup_registers_string(expected, actual, printBuff);
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
-  //enable the fifo
-  writeReg(REG_USER_CTRL, FIFO_EN);
-  HAL_Delay(100);
-
+  //run the factory tests for accelerometer and gyroscope, then print the results
   FACTORY_TEST_RESULTS gyroResults = gyro_self_test(readReg, writeReg, delay);
   FACTORY_TEST_RESULTS accelResults = accel_self_test(readReg, writeReg, delay);
-  SelfTests_Print(gyroResults, accelResults);
-  
+  stringLen = build_self_tests_string(gyroResults, accelResults, printBuff);
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
+
+  //run a test that polls each axis individually
   uint16_t sampleRate = 100; //Hz
   uint16_t sampleTime = 250; //ms
   int numSamples = 6 * MS_TO_S((float)sampleTime) * sampleRate;
 
   float data[numSamples];
   poll_axes_individually(sampleRate, sampleTime, ACCEL_FS_2_DIV, GYRO_FS_250_DIV, data, readReg, delay, getTime);
-  pollAxes_Print(data, numSamples);
+  stringLen = build_poll_axes_string(data, numSamples, printBuff);
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
   //fifo related tests
+  uint16_t fifoCountResults[NUM_FIFO_COUNT_TESTS];
+  uint32_t timePerIter[NUM_FIFO_COUNT_TESTS];
+  float bytesPerRead = -1;
 
-  // //3 gyro axes at 100Hz for 1 sec
+
+  //enable the fifo
+  writeReg(REG_USER_CTRL, FIFO_EN);
+  delay(100);
+  
+  //run tests on the fifo that control how much data is written
+  //to the fifo in one cycle, by variying the number of axes writing
+  //to the fifo and their sample rate
+  
+  //3 gyro axes at 100Hz for 1 sec
   writeReg(REG_FIFO_EN, XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  fifo_count_test(1000, 100, 3, burstRead, readReg);
-
-  // //3 accel axes at 100Hz for 1 sec
+  fifo_count_test(
+    1000, 
+    100, 
+    3, 
+    burstRead, 
+    readReg, 
+    delay, 
+    getTime, 
+    fifoCountResults, 
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
+  
+  //3 accel axes at 100Hz for 1 sec
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN);
-  fifo_count_test(1000, 100, 3, burstRead, readReg);
+  fifo_count_test(
+    1000, 
+    100, 
+    3, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
-  // //6 axes at 100Hz for 2 sec (should fail)
+  //6 axes at 100Hz for 2 sec (should fail)
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  fifo_count_test(2000, 100, 6, burstRead, readReg);
+  fifo_count_test(
+    2000, 
+    100, 
+    6, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
+  
 
-  // //3 accel axes at 100Hz for 2 sec (should fail)
+  //3 accel axes at 100Hz for 2 sec (should fail)
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN);
-  fifo_count_test(2000, 100, 3, burstRead, readReg);
+  fifo_count_test(
+    2000, 
+    100, 
+    3, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
-  // //6 axes at 100Hz for 350ms
+  //6 axes at 100Hz for 350ms
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  fifo_count_test(350, 100, 6, burstRead, readReg);
+  fifo_count_test(
+    350, 
+    100, 
+    6, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
   
   //6 axes at 50Hz for 800ms
   writeReg(REG_SMPRT_DIV, SAMPLE_RATE_50Hz);
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  fifo_count_test(800, 50, 6, burstRead, readReg);
+  fifo_count_test(
+    800, 
+    50, 
+    6, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
   //6 axes at 200Hz for 200ms
   writeReg(REG_SMPRT_DIV, SAMPLE_RATE_200Hz);
   writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  fifo_count_test(200, 200, 6, burstRead, readReg);
+  fifo_count_test(
+    200, 
+    200, 
+    6, 
+    burstRead, 
+    readReg,
+    delay,
+    getTime,
+    fifoCountResults,
+    timePerIter,
+    &bytesPerRead
+  );
+  stringLen = build_fifo_count_string(
+    fifoCountResults, 
+    timePerIter,
+    bytesPerRead,
+    printBuff
+  );
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
 
   //seems like the fifo doesn't like to work if it gets filled with much more than 600 bytes?
-  writeReg(REG_SMPRT_DIV, SAMPLE_RATE_100Hz);
-  writeReg(REG_FIFO_EN, 0); //disable fifo for poll axis test
   
-  writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN);
-  read_fifo_test(500, burstRead, readReg);
+  //test gathering data from the fifo
+  writeReg(REG_SMPRT_DIV, SAMPLE_RATE_100Hz);
+  writeReg(REG_FIFO_EN, ACCEL_FIFO_EN | XG_FIFO_EN | YG_FIFO_EN | ZG_FIFO_EN); //enable all 6 axes to be placed in fifo
+  uint8_t fifoData[NUM_READ_FIFO_TESTS][FIFO_SIZE];
+  uint16_t fifoCounts[NUM_READ_FIFO_TESTS];
+  read_fifo_test(
+    50, //really short fifo read period to keep the printed string from being too big
+    fifoData,
+    fifoCounts,
+    burstRead, 
+    readReg,
+    delay,
+    getTime
+  ); 
 
+  stringLen = build_read_fifo_string(
+    ACCEL_FS_2_DIV, 
+    GYRO_FS_250_DIV,
+    fifoData,
+    fifoCounts,
+    printBuff
+  );
 
+  HAL_UART_Transmit(&huart2, (uint8_t*)printBuff, stringLen, 100);
+  memset(printBuff, '\0', PRINT_BUFF_SIZE);
+
+  char endString[21] = "\r\n**Tests Complete**\0";
+  HAL_UART_Transmit(&huart2, (uint8_t*)endString, 21, 100);
 
   /* USER CODE END 2 */
 
@@ -240,138 +428,47 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void SelfTests_Print(FACTORY_TEST_RESULTS gyroResults, FACTORY_TEST_RESULTS accelResults)
+int stm32_reg_write_mpu6050(uint16_t regAddr, uint8_t regValue)
 {
-  char buff[100];
-  uint8_t buffSize = 0;
-
-  //gyro
-  buffSize = sprintf(
-    buff,
-    "\r\nGyro X self test: %c, change from factory trim: %f%%", 
-    gyroResults.failPercent > gyroResults.xAxis && gyroResults.xAxis > -gyroResults.failPercent ? 'P' : 'F' , 
-    gyroResults.xAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
-
-  buffSize = sprintf(
-    buff,
-    "\r\nGyro Y self test: %c, change from factory trim: %f%%", 
-    gyroResults.failPercent > gyroResults.yAxis && gyroResults.yAxis > -gyroResults.failPercent ? 'P' : 'F' , 
-    gyroResults.yAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
-
-  buffSize = sprintf(
-    buff,
-    "\r\nGyro Z self test: %c, change from factory trim: %f%%", 
-    gyroResults.failPercent > gyroResults.zAxis && gyroResults.zAxis > -gyroResults.failPercent ? 'P' : 'F' , 
-    gyroResults.zAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
-
-
-  //accel
-  buffSize = sprintf(
-    buff,
-    "\r\nAccel X self test: %c, change from factory trim: %f%%", 
-    accelResults.failPercent > accelResults.xAxis && accelResults.xAxis > -accelResults.failPercent ? 'P' : 'F' , 
-    accelResults.xAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
-
-  buffSize = sprintf(
-    buff,
-    "\r\nAccel Y self test: %c, change from factory trim: %f%%", 
-    accelResults.failPercent > accelResults.yAxis && accelResults.yAxis > -accelResults.failPercent ? 'P' : 'F' , 
-    accelResults.yAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
-
-  buffSize = sprintf(
-    buff,
-    "\r\nAccel Z self test: %c, change from factory trim: %f%%", 
-    accelResults.failPercent > accelResults.zAxis && accelResults.zAxis > -accelResults.failPercent ? 'P' : 'F' , 
-    accelResults.zAxis
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)buff, buffSize, 100);
-  buff[0] = '\0';
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Write(
+        &hi2c1,
+        MPU_6050_HAL_I2C_ADDR,
+        regAddr,
+        I2C_MEMADD_SIZE_8BIT,
+        &regValue,
+        SIZE_1_BYTE,
+        HAL_I2C_TIMEOUT
+    );
+    return status;
 }
 
-void ReadSetupRegisters_Print(SETUP_REGISTERS vals)
+int stm32_reg_read_mpu6050(uint16_t regAddr, uint8_t* valAddr)
 {
-
-  char txBuff[100];
-  uint8_t uart_buf_len;
-  uart_buf_len = sprintf(
-        txBuff, 
-        "\r\n\n Config Reg: \r\n  FSYNC: %d, %c\r\n  DLPF: %d, %c\r\n", 
-        vals.fsync, 
-        vals.fsync == EXT_SYNC_OFF ? 't' : 'f',
-        vals.dlpf,
-        vals.dlpf == DLPF_CFG_6 ? 't' : 'f'
+    HAL_StatusTypeDef status = HAL_I2C_Mem_Read(
+        &hi2c1, 
+        MPU_6050_HAL_I2C_ADDR,
+        regAddr,
+        I2C_MEMADD_SIZE_8BIT,
+        valAddr,
+        I2C_MEMADD_SIZE_8BIT,
+        HAL_I2C_TIMEOUT
     );
-    HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, uart_buf_len, 100);
-    txBuff[0] = '\0';
-
-  uart_buf_len = sprintf(
-      txBuff, 
-      "\r\n\n Gyro Full Scale: \r\n  FS: %d, %c\r\n", 
-      vals.gyro_sel, 
-      vals.gyro_sel == GYRO_FS_SEL_250_DPS ? 't' : 'f'
-  );
-  HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, uart_buf_len, 100);
-  txBuff[0] = '\0';
-
-  uart_buf_len = sprintf(
-        txBuff, 
-        "\r\n\n Accel Config Reg: \r\n  Full Scale: %d, %c\r\n", 
-        vals.fs, 
-        vals.fs == ACCEL_FS_2G ? 't' : 'f'
-    );
-    HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, uart_buf_len, 100);
-    txBuff[0] = '\0';
-
-  uart_buf_len = sprintf(
-        txBuff, 
-        "\r\n\n Gyro SR Div: \r\n  Divider: %d, %c\r\n", 
-        vals.rate_div, 
-        vals.rate_div == SAMPLE_RATE_100Hz ? 't' : 'f'
-    );
-    HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, uart_buf_len, 100);
-    txBuff[0] = '\0';
+    return status;
 }
 
-void pollAxes_Print(float *data, uint16_t size)
+int stm32_burst_read_mpu6050(uint16_t regAddr, uint8_t* data, uint16_t bytes)
 {
-  //write data out to uart
-  uint16_t i = 0;
-  int buffLen = 0;
-  char txBuff[100];
-
-  //print table header
-  buffLen = sprintf(txBuff, "\r\n\naccelX, accelY, accelZ, gyroX, gyroY, gyroZ");
-  HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
-  txBuff[0] = '\0';
-
-  while(i < size)
-  {
-      buffLen = sprintf(txBuff, "\r\n%.2f, %.2f, %.2f, %.2f, %.2f, %.2f", 
-          data[i], data[i + 1], data[i + 2], //accel xyz
-          data[i + 3], data[i + 4], data[i + 5] //gyro xyz
-      );
-      HAL_UART_Transmit(&huart2, (uint8_t*)txBuff, buffLen, 100);
-      txBuff[0] = '\0';
-      i += 6;
-  }
+     HAL_StatusTypeDef status = HAL_I2C_Mem_Read(
+        &hi2c1, 
+        MPU_6050_HAL_I2C_ADDR,
+        regAddr,
+        I2C_MEMADD_SIZE_8BIT,
+        data,
+        bytes,
+        HAL_I2C_TIMEOUT
+    );
+    return status;
 }
-
-
 /* USER CODE END 4 */
 
 /**
