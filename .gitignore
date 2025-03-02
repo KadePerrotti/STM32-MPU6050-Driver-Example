@@ -8,3 +8,11 @@
 .mxproject
 .project
 *.launch
+
+*.ioc
+*.ld
+
+Core/Inc/*
+Core/Startup/*
+Drivers/CMIS/*
+Drivers/STM32*
